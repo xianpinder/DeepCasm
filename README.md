@@ -1,4 +1,4 @@
-# eZ80 Assembler and Linker
+# Deep C - eZ80 Assembler and Linker
 
 A portable assembler and linker for the Zilog eZ80 processor, created for use with the Deep C compiler on the AgonLight/Console 8.
 
