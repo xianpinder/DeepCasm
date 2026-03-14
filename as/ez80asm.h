@@ -41,6 +41,7 @@
 #define TOK_DOT         17
 #define TOK_EQUALS      18
 #define TOK_ERROR       19
+#define TOK_AMPERSAND   20
 
 /* Token structure */
 typedef struct {
@@ -230,7 +231,6 @@ void asm_error(AsmState *as, const char *fmt, ...);
 void asm_warning(AsmState *as, const char *fmt, ...);
 
 /* Function prototypes - Instructions */
-int instr_lookup(const char *mnemonic);
 int instr_execute(AsmState *as, const char *mnemonic);
 
 /* Function prototypes - Directives */

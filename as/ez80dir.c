@@ -61,8 +61,8 @@ int directive_execute(AsmState *as, const char *name)
         str_casecmp(dir, "public") == 0 ||
         str_casecmp(dir, "global") == 0) return dir_xdef(as);
     if (str_casecmp(dir, "xref") == 0 ||
-        str_casecmp(dir, "extern") == 0 ||
-        str_casecmp(dir, "external") == 0) return dir_xref(as);
+        str_casecmp(dir, "extrn") == 0 ||
+        str_casecmp(dir, "extern") == 0) return dir_xref(as);
     if (str_casecmp(dir, "end") == 0) return dir_end(as);
     if (str_casecmp(dir, "align") == 0) return dir_align(as);
     if (str_casecmp(dir, "ascii") == 0) return dir_ascii(as);
@@ -705,7 +705,7 @@ int asm_pass(AsmState *as, FILE *fp)
         
         asm_line(as, line);
     }
-    
+
     return as->errors;
 }
 

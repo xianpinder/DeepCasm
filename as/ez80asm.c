@@ -162,6 +162,8 @@ Token *lexer_next(AsmState *as)
                   tok->text[1] = '\0'; return tok;
         case '=': tok->type = TOK_EQUALS; tok->text[0] = *as->line_ptr++; 
                   tok->text[1] = '\0'; return tok;
+        case '&': tok->type = TOK_AMPERSAND; tok->text[0] = *as->line_ptr++; 
+                  tok->text[1] = '\0'; return tok;
     }
     
     /* Number */
@@ -775,11 +777,26 @@ static int24 parse_expr_add(AsmState *as, char *symbol_out, int *has_symbol)
     return val;
 }
 
+/* Bitwise AND - lowest precedence */
+static int24 parse_expr_bitand(AsmState *as, char *symbol_out, int *has_symbol)
+{
+    int24 val;
+    
+    val = parse_expr_add(as, symbol_out, has_symbol);
+    
+    while (as->current_token.type == TOK_AMPERSAND) {
+        lexer_next(as);
+        val &= parse_expr_add(as, symbol_out, has_symbol);
+    }
+    
+    return val;
+}
+
 int parse_expression(AsmState *as, int24 *result, char *symbol_out)
 {
     int has_symbol = 0;
     symbol_out[0] = '\0';
-    *result = parse_expr_add(as, symbol_out, &has_symbol);
+    *result = parse_expr_bitand(as, symbol_out, &has_symbol);
     return has_symbol;
 }
 
@@ -801,6 +818,10 @@ int parse_operand(AsmState *as, Operand *op)
     
     /* Check for indirect addressing (xxx) */
     if (tok->type == TOK_LPAREN) {
+        /* Save position in case parens turn out to be expression grouping */
+        const char *saved_ptr = as->line_ptr;
+        Token saved_tok = *tok;
+        
         lexer_next(as);
         /* tok now points to the updated current_token */
         
@@ -895,7 +916,7 @@ int parse_operand(AsmState *as, Operand *op)
             }
         }
         
-        /* Not a register - must be address */
+        /* Not a register - must be address or expression grouping */
         op->type = OP_ADDR;
         op->has_symbol = parse_expression(as, &op->value, op->symbol);
         
@@ -904,7 +925,21 @@ int parse_operand(AsmState *as, Operand *op)
             return -1;
         }
         lexer_next(as);
-        return 0;
+        
+        /* If followed by an operator, the parens were expression grouping
+         * not indirect addressing. Backtrack and let the expression parser
+         * handle it as OP_IMM. e.g. CP (RTABLE-DTABLE)/3 */
+        if (as->current_token.type == TOK_STAR ||
+            as->current_token.type == TOK_SLASH ||
+            as->current_token.type == TOK_PLUS ||
+            as->current_token.type == TOK_MINUS ||
+            as->current_token.type == TOK_AMPERSAND) {
+            as->line_ptr = saved_ptr;
+            *tok = saved_tok;
+            /* Fall through to expression/immediate parsing below */
+        } else {
+            return 0;
+        }
     }
     
     /* Check for register or condition code */

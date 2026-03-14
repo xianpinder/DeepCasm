@@ -11,73 +11,8 @@
 #include <ctype.h>
 #include "ez80asm.h"
 
-/* ============================================================
- * Simple (No-Operand) Instructions - Data-Driven
- * ============================================================ */
-
-/* Simple instruction: just a prefix (0 = none) and an opcode byte */
-typedef struct {
-    const char *mnemonic;
-    uint8 prefix;   /* 0x00 = no prefix, 0xED = ED prefix */
-    uint8 opcode;
-} SimpleInstr;
-
-/* Sorted alphabetically for binary search */
-static const SimpleInstr simple_table[] = {
-    {"ccf",   0x00, 0x3F},
-    {"cpd",   0xED, 0xA9},
-    {"cpdr",  0xED, 0xB9},
-    {"cpi",   0xED, 0xA1},
-    {"cpir",  0xED, 0xB1},
-    {"cpl",   0x00, 0x2F},
-    {"daa",   0x00, 0x27},
-    {"di",    0x00, 0xF3},
-    {"ei",    0x00, 0xFB},
-    {"exx",   0x00, 0xD9},
-    {"halt",  0x00, 0x76},
-    {"ind",   0xED, 0xAA},
-    {"indr",  0xED, 0xBA},
-    {"ini",   0xED, 0xA2},
-    {"inir",  0xED, 0xB2},
-    {"ldd",   0xED, 0xA8},
-    {"lddr",  0xED, 0xB8},
-    {"ldi",   0xED, 0xA0},
-    {"ldir",  0xED, 0xB0},
-    {"neg",   0xED, 0x44},
-    {"nop",   0x00, 0x00},
-    {"otdr",  0xED, 0xBB},
-    {"otir",  0xED, 0xB3},
-    {"outd",  0xED, 0xAB},
-    {"outi",  0xED, 0xA3},
-    {"reti",  0xED, 0x4D},
-    {"retn",  0xED, 0x45},
-    {"rla",   0x00, 0x17},
-    {"rlca",  0x00, 0x07},
-    {"rld",   0xED, 0x6F},
-    {"rra",   0x00, 0x1F},
-    {"rrca",  0x00, 0x0F},
-    {"rrd",   0xED, 0x67},
-    {"rsmix", 0xED, 0x7E},
-    {"scf",   0x00, 0x37},
-    {"slp",   0xED, 0x76},
-    {"stmix", 0xED, 0x7D}
-};
-#define NUM_SIMPLE (sizeof(simple_table) / sizeof(simple_table[0]))
-
-/* Look up a simple instruction by (already lowercased) mnemonic.
- * Returns pointer to entry, or NULL if not found. */
-static const SimpleInstr *simple_lookup(const char *lower)
-{
-    int lo = 0, hi = (int)NUM_SIMPLE - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int cmp = strcmp(lower, simple_table[mid].mnemonic);
-        if (cmp == 0) return &simple_table[mid];
-        if (cmp < 0) hi = mid - 1;
-        else lo = mid + 1;
-    }
-    return NULL;
-}
+/* Forward declare handler type for unified instruction table */
+typedef int (*InstrHandler)(AsmState *as);
 
 
 /* Helper: get 8-bit register encoding (for r field) */
@@ -685,9 +620,7 @@ static int emit_alu8(AsmState *as, int aluop, Operand *src)
     return -1;
 }
 
-/* Shared handler for ADD / ADD.S.
- * sil_prefix: 0 for ADD, 0x52 for ADD.S */
-static int handle_add_impl(AsmState *as, int sil_prefix, const char *name)
+static int handle_add(AsmState *as)
 {
     Operand dest, src;
     int ss, pp;
@@ -696,53 +629,46 @@ static int handle_add_impl(AsmState *as, int sil_prefix, const char *name)
     if (parse_operand(as, &dest) < 0) return -1;
     
     if (as->current_token.type != TOK_COMMA) {
-        if (!sil_prefix && emit_alu8(as, 0, &dest) == 0) return 0;
-        asm_error(as, "invalid operand for %s", name);
+        if (emit_alu8(as, 0, &dest) == 0) return 0;
+        asm_error(as, "invalid operand for ADD");
         return -1;
     }
     
     lexer_next(as);
     if (parse_operand(as, &src) < 0) return -1;
     
-    if (!sil_prefix && dest.type == OP_REG && dest.reg == REG_A) {
+    if (dest.type == OP_REG && dest.reg == REG_A) {
         if (emit_alu8(as, 0, &src) == 0) return 0;
     }
     
-    /* ADD/ADD.S HL, ss */
+    /* ADD HL, ss */
     if (dest.type == OP_REG && dest.reg == REG_HL && src.type == OP_REG) {
         ss = get_reg16_dd_code(src.reg);
         if (ss >= 0) {
-            if (sil_prefix) emit_byte(as, sil_prefix);
             emit_byte(as, 0x09 | (ss << 4));
             return 0;
         }
     }
     
-    /* ADD/ADD.S IX, pp / IY, rr */
+    /* ADD IX, pp / IY, rr */
     if (dest.type == OP_REG &&
         (dest.reg == REG_IX || dest.reg == REG_IY) && src.type == OP_REG) {
         pp = get_idx_pair_code(dest.reg, src.reg);
         if (pp >= 0) {
-            if (sil_prefix) emit_byte(as, sil_prefix);
             emit_idx_reg_prefix(as, dest.reg);
             emit_byte(as, 0x09 | (pp << 4));
             return 0;
         }
     }
     
-    asm_error(as, "invalid operands for %s", name);
+    asm_error(as, "invalid operands for ADD");
     return -1;
 }
 
-static int handle_add(AsmState *as)   { return handle_add_impl(as, 0, "ADD"); }
-static int handle_add_s(AsmState *as) { return handle_add_impl(as, 0x52, "ADD.S"); }
-
-/* Shared handler for ADC/SBC and ADC.S/SBC.S.
- * aluop:      1 (ADC) or 3 (SBC) - for 8-bit ALU encoding
- * hl_op:      0x4A (ADC) or 0x42 (SBC) - for HL,ss encoding
- * sil_prefix: 0 for normal, 0x52 for .S variants */
-static int handle_adc_sbc(AsmState *as, int aluop, int hl_op,
-                          int sil_prefix, const char *name)
+/* Shared handler for ADC/SBC.
+ * aluop:  1 (ADC) or 3 (SBC) - for 8-bit ALU encoding
+ * hl_op:  0x4A (ADC) or 0x42 (SBC) - for HL,ss encoding */
+static int handle_adc_sbc(AsmState *as, int aluop, int hl_op, const char *name)
 {
     Operand dest, src;
     int ss;
@@ -751,7 +677,7 @@ static int handle_adc_sbc(AsmState *as, int aluop, int hl_op,
     if (parse_operand(as, &dest) < 0) return -1;
     
     if (as->current_token.type != TOK_COMMA) {
-        if (!sil_prefix && emit_alu8(as, aluop, &dest) == 0) return 0;
+        if (emit_alu8(as, aluop, &dest) == 0) return 0;
         asm_error(as, "invalid operand for %s", name);
         return -1;
     }
@@ -759,7 +685,7 @@ static int handle_adc_sbc(AsmState *as, int aluop, int hl_op,
     lexer_next(as);
     if (parse_operand(as, &src) < 0) return -1;
     
-    if (!sil_prefix && dest.type == OP_REG && dest.reg == REG_A) {
+    if (dest.type == OP_REG && dest.reg == REG_A) {
         if (emit_alu8(as, aluop, &src) == 0) return 0;
     }
     
@@ -767,7 +693,6 @@ static int handle_adc_sbc(AsmState *as, int aluop, int hl_op,
     if (dest.type == OP_REG && dest.reg == REG_HL && src.type == OP_REG) {
         ss = get_reg16_dd_code(src.reg);
         if (ss >= 0) {
-            if (sil_prefix) emit_byte(as, sil_prefix);
             emit_byte(as, 0xED);
             emit_byte(as, hl_op | (ss << 4));
             return 0;
@@ -778,10 +703,8 @@ static int handle_adc_sbc(AsmState *as, int aluop, int hl_op,
     return -1;
 }
 
-static int handle_adc(AsmState *as)   { return handle_adc_sbc(as, 1, 0x4A, 0, "ADC"); }
-static int handle_sbc(AsmState *as)   { return handle_adc_sbc(as, 3, 0x42, 0, "SBC"); }
-static int handle_adc_s(AsmState *as) { return handle_adc_sbc(as, 1, 0x4A, 0x52, "ADC.S"); }
-static int handle_sbc_s(AsmState *as) { return handle_adc_sbc(as, 3, 0x42, 0x52, "SBC.S"); }
+static int handle_adc(AsmState *as)   { return handle_adc_sbc(as, 1, 0x4A, "ADC"); }
+static int handle_sbc(AsmState *as)   { return handle_adc_sbc(as, 3, 0x42, "SBC"); }
 
 /* Shared handler for simple ALU ops: AND, OR, XOR, CP, SUB
  * All accept optional "A," prefix and delegate to emit_alu8 */
@@ -1119,17 +1042,6 @@ static int handle_rst(AsmState *as)
     
     if (parse_rst_vector(as, &vec) < 0) return -1;
     
-    emit_byte(as, 0xC7 | vec);
-    return 0;
-}
-
-static int handle_rst_lil(AsmState *as)
-{
-    uint8 vec;
-    
-    if (parse_rst_vector(as, &vec) < 0) return -1;
-    
-    emit_byte(as, 0x5B);  /* .LIL suffix prefix in ADL mode */
     emit_byte(as, 0xC7 | vec);
     return 0;
 }
@@ -1484,65 +1396,158 @@ static int handle_tst(AsmState *as)
  * Instruction Table and Lookup
  * ============================================================ */
 
-/* Instruction handler function type */
-typedef int (*InstrHandler)(AsmState *as);
+/* ============================================================
+ * Unified Instruction Table with Perfect Hash Lookup
+ *
+ * Hash function generated by gperf from the frozen mnemonic set.
+ * Single lookup handles both simple (no-operand) and complex
+ * instructions. Simple: handler==NULL, emit prefix+opcode.
+ * Complex: handler!=NULL, call handler.
+ * ============================================================ */
 
-/* Instruction table entry */
+/* Unified instruction entry */
 typedef struct {
     const char *mnemonic;
-    InstrHandler handler;
+    InstrHandler handler;   /* NULL = simple (emit prefix+opcode) */
+    uint8 prefix;           /* simple: 0xED or 0x00 */
+    uint8 opcode;           /* simple: opcode byte */
 } InstrEntry;
 
-/* Instruction table - sorted alphabetically for binary search.
- * Only contains instructions that need custom handler functions.
- * Simple no-operand instructions are handled via simple_table above. */
-static InstrEntry instr_table[] = {
-    {"adc",     handle_adc},
-    {"adc.s",   handle_adc_s},
-    {"add",     handle_add},
-    {"add.s",   handle_add_s},
-    {"and",     handle_and},
-    {"bit",     handle_bit},
-    {"call",    handle_call},
-    {"cp",      handle_cp},
-    {"dec",     handle_dec},
-    {"djnz",    handle_djnz},
-    {"ex",      handle_ex},
-    {"im",      handle_im},
-    {"in",      handle_in},
-    {"in0",     handle_in0},
-    {"inc",     handle_inc},
-    {"jp",      handle_jp},
-    {"jr",      handle_jr},
-    {"ld",      handle_ld},
-    {"lea",     handle_lea},
-    {"mlt",     handle_mlt},
-    {"or",      handle_or},
-    {"out",     handle_out},
-    {"out0",    handle_out0},
-    {"pea",     handle_pea},
-    {"pop",     handle_pop},
-    {"push",    handle_push},
-    {"res",     handle_res},
-    {"ret",     handle_ret},
-    {"rl",      handle_rl},
-    {"rlc",     handle_rlc},
-    {"rr",      handle_rr},
-    {"rrc",     handle_rrc},
-    {"rst",     handle_rst},
-    {"rst.lil", handle_rst_lil},
-    {"sbc",     handle_sbc},
-    {"sbc.s",   handle_sbc_s},
-    {"set",     handle_set},
-    {"sla",     handle_sla},
-    {"sra",     handle_sra},
-    {"srl",     handle_srl},
-    {"sub",     handle_sub},
-    {"tst",     handle_tst},
-    {"xor",     handle_xor},
-    {NULL,      NULL}
+/* Perfect hash - computed positions: k'1-4'
+ * Generated by gperf, max hash value 95 */
+static const unsigned char asso_values[] =
+{
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96,  6, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96, 96, 96, 96,
+      96, 96, 96, 96, 96, 96, 96,  9, 38, 25,
+       3, 38, 25, 11,  4, 11,  3, 96,  6, 18,
+      14, 55, 20, 96,  4, 28, 15,  3, 96, 96,
+      24, 96,  7, 96, 96, 96, 96, 96
 };
-#define NUM_INSTRS (sizeof(instr_table) / sizeof(instr_table[0]) - 1)
+
+static unsigned int instr_hash(const char *str, unsigned int len)
+{
+	unsigned int hval = 0;
+
+	switch (len) {
+		default: hval += asso_values[(unsigned char)str[3]]; /*FALLTHROUGH*/
+		case 3:	 hval += asso_values[(unsigned char)str[2]]; /*FALLTHROUGH*/
+		case 2:	 hval += asso_values[(unsigned char)str[1]]; /*FALLTHROUGH*/
+		case 1:	 hval += asso_values[(unsigned char)str[0]]; break;
+	}
+	return hval;
+}
+
+#define MAX_HASH_VALUE 95
+
+/* Unified instruction wordlist - indexed by perfect hash.
+ * Empty slots have mnemonic==NULL (zero-initialized).
+ * 76 instructions, hash range 7..95. */
+static const InstrEntry instr_wordlist[MAX_HASH_VALUE + 1] = {
+    {0},
+	{0},
+	{0},
+	{0},
+	{0},
+	{0},
+	{0},
+    {"jr",     handle_jr, 0x00, 0x00},
+    {"rr",     handle_rr, 0x00, 0x00},
+    {"ld",     handle_ld, 0x00, 0x00},
+    {"rl",     handle_rl, 0x00, 0x00},
+    {"rrd",    NULL, 0xED, 0x67},
+    {"ldd",    NULL, 0xED, 0xA8},
+    {"rld",    NULL, 0xED, 0x6F},
+    {"di",     NULL, 0x00, 0xF3},
+    {"add",    handle_add, 0x00, 0x00},
+    {"lddr",   NULL, 0xED, 0xB8},
+    {"rra",    NULL, 0x00, 0x1F},
+    {0},
+    {"rla",    NULL, 0x00, 0x17},
+    {"ldi",    NULL, 0xED, 0xA0},
+    {"daa",    NULL, 0x00, 0x27},
+    {0},
+    {"jp",     handle_jp, 0x00, 0x00},
+    {"ldir",   NULL, 0xED, 0xB0},
+    {"in",     handle_in, 0x00, 0x00},
+    {"and",    handle_and, 0x00, 0x00},
+    {"djnz",   handle_djnz, 0x00, 0x00},
+    {"ind",    NULL, 0xED, 0xAA},
+    {"im",     handle_im, 0x00, 0x00},
+    {0},
+    {"in0",    handle_in0, 0x00, 0x00},
+    {"indr",   NULL, 0xED, 0xBA},
+    {"rrc",    handle_rrc, 0x00, 0x00},
+    {"halt",   NULL, 0x00, 0x76},
+    {"rlc",    handle_rlc, 0x00, 0x00},
+    {"ini",    NULL, 0xED, 0xA2},
+    {"adc",    handle_adc, 0x00, 0x00},
+    {"srl",    handle_srl, 0x00, 0x00},
+    {"mlt",    handle_mlt, 0x00, 0x00},
+    {"inir",   NULL, 0xED, 0xB2},
+    {"sra",    handle_sra, 0x00, 0x00},
+    {"rrca",   NULL, 0x00, 0x0F},
+    {"sla",    handle_sla, 0x00, 0x00},
+    {"rlca",   NULL, 0x00, 0x07},
+    {"cp",     handle_cp, 0x00, 0x00},
+    {"call",   handle_call, 0x00, 0x00},
+    {"rst",    handle_rst, 0x00, 0x00},
+    {"cpd",    NULL, 0xED, 0xA9},
+    {"ei",     NULL, 0x00, 0xFB},
+    {"inc",    handle_inc, 0x00, 0x00},
+    {"cpl",    NULL, 0x00, 0x2F},
+    {"cpdr",   NULL, 0xED, 0xB9},
+    {"lea",    handle_lea, 0x00, 0x00},
+    {"slp",    NULL, 0xED, 0x76},
+    {"push",   handle_push, 0x00, 0x00},
+    {"cpi",    NULL, 0xED, 0xA1},
+    {"ret",    handle_ret, 0x00, 0x00},
+    {"tst",    handle_tst, 0x00, 0x00},
+    {"or",     handle_or, 0x00, 0x00},
+    {"cpir",   NULL, 0xED, 0xB1},
+    {"rsmix",  NULL, 0xED, 0x7E},
+    {"ex",     handle_ex, 0x00, 0x00},
+    {"neg",    NULL, 0xED, 0x44},
+    {"bit",    handle_bit, 0x00, 0x00},
+    {0},
+    {"dec",    handle_dec, 0x00, 0x00},
+    {"pea",    handle_pea, 0x00, 0x00},
+    {"reti",   NULL, 0xED, 0x4D},
+    {"sub",    handle_sub, 0x00, 0x00},
+    {"res",    handle_res, 0x00, 0x00},
+    {"retn",   NULL, 0xED, 0x45},
+    {"stmix",  NULL, 0xED, 0x7D},
+    {"out",    handle_out, 0x00, 0x00},
+    {0},
+    {"ccf",    NULL, 0x00, 0x3F},
+    {"outd",   NULL, 0xED, 0xAB},
+    {"otdr",   NULL, 0xED, 0xBB},
+    {"scf",    NULL, 0x00, 0x37},
+    {"out0",   handle_out0, 0x00, 0x00},
+    {0},
+    {"set",    handle_set, 0x00, 0x00},
+    {0},
+    {"xor",    handle_xor, 0x00, 0x00},
+    {"outi",   NULL, 0xED, 0xA3},
+    {"otir",   NULL, 0xED, 0xB3},
+    {"exx",    NULL, 0x00, 0xD9},
+    {0},
+	{0},
+    {"nop",    NULL, 0x00, 0x00},
+    {0},
+    {"sbc",    handle_sbc, 0x00, 0x00},
+    {0},
+	{0},
+	{0},
+    {"pop",    handle_pop, 0x00, 0x00}
+};
 
 /* Lowercase a string into a fixed-size buffer */
 static void instr_tolower(char *dest, const char *src, int maxlen)
@@ -1554,54 +1559,66 @@ static void instr_tolower(char *dest, const char *src, int maxlen)
     dest[i] = '\0';
 }
 
-int instr_lookup(const char *lower)
-{
-    int lo = 0, hi = (int)NUM_INSTRS - 1;
-    while (lo <= hi) {
-        int mid = (lo + hi) / 2;
-        int cmp = strcmp(lower, instr_table[mid].mnemonic);
-        if (cmp == 0) return mid;
-        if (cmp < 0) hi = mid - 1;
-        else lo = mid + 1;
-    }
-    return -1;
-}
-
 int instr_execute(AsmState *as, const char *mnemonic)
 {
     char lower[16];
-    const SimpleInstr *si;
-    int idx;
+    const InstrEntry *ie;
+    unsigned int key;
+    int len;
     int result;
+    int suffix_byte = 0;
+    char *dot;
     
     instr_tolower(lower, mnemonic, sizeof(lower));
     
-    /* Try simple (no-operand) instructions first */
-    si = simple_lookup(lower);
-    if (si) {
-        lexer_next(as);
-        if (si->prefix) emit_byte(as, si->prefix);
-        emit_byte(as, si->opcode);
-        /* Check for unparsed content */
-        if (as->current_token.type != TOK_EOL &&
-            as->current_token.type != TOK_EOF) {
-            asm_error(as, "unexpected content after instruction");
+    /* Check for suffix (.S, .L, .IS, .IL, .SIS, .SIL, .LIS, .LIL) */
+    dot = strchr(lower, '.');
+    if (dot) {
+        const char *suf = dot + 1;
+        if (strcmp(suf, "sis") == 0)      suffix_byte = 0x40;
+        else if (strcmp(suf, "sil") == 0) suffix_byte = 0x52;
+        else if (strcmp(suf, "lis") == 0) suffix_byte = 0x49;
+        else if (strcmp(suf, "lil") == 0) suffix_byte = 0x5B;
+        else if (strcmp(suf, "s") == 0)   suffix_byte = 0x52;
+        else if (strcmp(suf, "l") == 0)   suffix_byte = 0x5B;
+        else if (strcmp(suf, "is") == 0)  suffix_byte = 0x49;
+        else if (strcmp(suf, "il") == 0)  suffix_byte = 0x5B;
+        else {
             return -1;
         }
-        return 0;
+        *dot = '\0';
     }
     
-    /* Fall through to complex instruction handlers */
-    idx = instr_lookup(lower);
-    if (idx < 0) {
+    /* Perfect hash lookup */
+    len = (int)strlen(lower);
+    if (len < 2 || len > 5)
         return -1;
-    }
     
-    result = instr_table[idx].handler(as);
+    key = instr_hash(lower, (unsigned int)len);
+    if (key > MAX_HASH_VALUE)
+        return -1;
+    
+    ie = &instr_wordlist[key];
+    if (!ie->mnemonic || strcmp(lower, ie->mnemonic) != 0)
+        return -1;
+    
+    /* Emit suffix prefix byte if present */
+    if (suffix_byte) emit_byte(as, suffix_byte);
+    
+    if (ie->handler) {
+        /* Complex instruction - call handler */
+        result = ie->handler(as);
+    } else {
+        /* Simple instruction - emit prefix + opcode */
+        lexer_next(as);
+        if (ie->prefix) emit_byte(as, ie->prefix);
+        emit_byte(as, ie->opcode);
+        result = 0;
+    }
     
     /* Check for unparsed content at end of line */
-    if (result == 0 && 
-        as->current_token.type != TOK_EOL && 
+    if (result == 0 &&
+        as->current_token.type != TOK_EOL &&
         as->current_token.type != TOK_EOF) {
         asm_error(as, "unexpected content after instruction");
         return -1;
