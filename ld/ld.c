@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include "objformat.h"
 
 /* Maximum limits */
@@ -19,12 +20,45 @@
 #define MAX_SYMBOLS     2048
 #define MAX_EXTERNS     1024
 #define MAX_FILENAME    256
-#define MAX_LIBRARIES   4
+#define MAX_LIBRARIES   16
 #define MAX_LIB_OBJECTS 256
-#define MAX_LIBDIRS     4  /* Library search directories */
+#define MAX_LIBDIRS     16  /* Library search directories */
+#define MAX_OBJ_EXTERNS 256 /* Max externals per single object */
 #define HASH_SIZE       256 /* Symbol hash table buckets (power of 2) */
+#define LIB_HASH_SIZE   256 /* Library index hash buckets */
+#define MAX_LIB_SYMS    1024 /* Max exported symbols across all libraries */
+#define MAX_SYM_NAME    64  /* Symbol name length (including '\0') */
+#define MAX_LIBSYM_NAME 32  /* Library index name length (including '\0') */
 
 #define LINKER_DEFINED  -1  /* obj_index for linker-defined symbols */
+
+/*
+ * Library symbol index entry.
+ * Maps an exported symbol name to the library object that defines it.
+ *
+ * Memory: 37 bytes per entry on eZ80 (int=3 bytes).
+ * At MAX_LIB_SYMS=1024: ~37KB total (dynamically allocated, freed
+ * after library resolution).
+ */
+typedef struct {
+    char name[MAX_LIBSYM_NAME];    /* Symbol name (truncated) */
+    uint8 lib_idx;              /* Index into ls->libraries[] (max 16) */
+    uint8 obj_idx;              /* Index into lib->objects[] (max 256) */
+    int hash_next;              /* Next entry in hash chain (-1 = end) */
+} LibSymEntry;
+
+/*
+ * Library symbol index.
+ * Built once when processing libraries; maps every exported symbol
+ * in every library object to its location.  Allocated dynamically
+ * and freed after library resolution is complete.
+ */
+typedef struct {
+    LibSymEntry *entries;
+    int num_entries;
+    int max_entries;
+    int hash_buckets[LIB_HASH_SIZE];
+} LibSymIndex;
 
 /* Library object entry (for scanning libraries) */
 typedef struct {
@@ -48,7 +82,7 @@ typedef struct {
 
 /* Global symbol entry */
 typedef struct {
-    char name[64];
+    char name[MAX_SYM_NAME];
     uint24 value;           /* Absolute address after linking */
     uint8 section;          /* Original section */
     int obj_index;          /* Which object file it came from */
@@ -125,13 +159,12 @@ static int add_global(LinkerState *ls, const char *name, uint24 value,
 static int str_casecmp(const char *a, const char *b)
 {
     while (*a && *b) {
-        char ca = *a, cb = *b;
-        if (ca >= 'A' && ca <= 'Z') ca += 32;
-        if (cb >= 'A' && cb <= 'Z') cb += 32;
+        unsigned char ca = tolower((unsigned char)*a);
+        unsigned char cb = tolower((unsigned char)*b);
         if (ca != cb) return ca - cb;
         a++; b++;
     }
-    return *a - *b;
+    return (unsigned char)*a - (unsigned char)*b;
 }
 
 /* String copy with length limit */
@@ -149,9 +182,8 @@ static unsigned sym_hash(const char *name)
 {
     unsigned h = 5381;
     while (*name) {
-        char c = *name++;
-        if (c >= 'A' && c <= 'Z') c += 32;
-        h = ((h << 5) + h) ^ (unsigned char)c;
+        unsigned char c = tolower((unsigned char)*name++);
+        h = ((h << 5) + h) ^ c;
     }
     return h & (HASH_SIZE - 1);
 }
@@ -191,7 +223,7 @@ static int add_global(LinkerState *ls, const char *name, uint24 value,
         return -1;
     }
     
-    str_copy(ls->symbols[ls->num_symbols].name, name, 64);
+    str_copy(ls->symbols[ls->num_symbols].name, name, MAX_SYM_NAME);
     ls->symbols[ls->num_symbols].value = value;
     ls->symbols[ls->num_symbols].section = section;
     ls->symbols[ls->num_symbols].obj_index = obj_index;
@@ -511,7 +543,7 @@ static int add_library(LinkerState *ls, const char *filename)
  * Uses an already-open FILE pointer to avoid repeated open/close.
  */
 static int get_object_externals_fp(FILE *fp, ObjectInfo *obj,
-                                   char externals[][64], int max_ext)
+                                   char externals[][MAX_SYM_NAME], int max_ext)
 {
     ObjExtern ext;
     char *strtab;
@@ -540,7 +572,7 @@ static int get_object_externals_fp(FILE *fp, ObjectInfo *obj,
         
         name_off = READ24(ext.name_offset);
         if (name_off < obj->strtab_size) {
-            str_copy(externals[count], &strtab[name_off], 64);
+            str_copy(externals[count], &strtab[name_off], MAX_SYM_NAME);
             count++;
         }
     }
@@ -549,21 +581,184 @@ static int get_object_externals_fp(FILE *fp, ObjectInfo *obj,
     return count;
 }
 
+/* Initialise a library symbol index */
+static int lib_index_init(LibSymIndex *idx)
+{
+    int i;
+    idx->entries = (LibSymEntry *)malloc(MAX_LIB_SYMS * sizeof(LibSymEntry));
+    if (!idx->entries) return -1;
+    idx->num_entries = 0;
+    idx->max_entries = MAX_LIB_SYMS;
+    for (i = 0; i < LIB_HASH_SIZE; i++) {
+        idx->hash_buckets[i] = -1;
+    }
+    return 0;
+}
+
+/* Free a library symbol index */
+static void lib_index_free(LibSymIndex *idx)
+{
+    if (idx->entries) {
+        free(idx->entries);
+        idx->entries = NULL;
+    }
+    idx->num_entries = 0;
+}
+
+/* Add a symbol to the library index */
+static int lib_index_add(LibSymIndex *idx, const char *name,
+                         int lib_idx, int obj_idx)
+{
+    unsigned bucket;
+    LibSymEntry *e;
+    
+    if (idx->num_entries >= idx->max_entries) {
+        return -1; /* Full */
+    }
+    
+    e = &idx->entries[idx->num_entries];
+    str_copy(e->name, name, MAX_LIBSYM_NAME);
+    e->lib_idx = (uint8)lib_idx;
+    e->obj_idx = (uint8)obj_idx;
+    
+    bucket = sym_hash(name);
+    e->hash_next = idx->hash_buckets[bucket];
+    idx->hash_buckets[bucket] = idx->num_entries;
+    idx->num_entries++;
+    
+    return 0;
+}
+
+/*
+ * Look up a symbol in the library index.
+ * Returns a pointer to the matching entry whose library object has
+ * not yet been loaded, or NULL if not found.
+ */
+static LibSymEntry *lib_index_find(LibSymIndex *idx, const char *name,
+                                   LinkerState *ls)
+{
+    int i = idx->hash_buckets[sym_hash(name)];
+    while (i >= 0) {
+        LibSymEntry *e = &idx->entries[i];
+        if (str_casecmp(e->name, name) == 0) {
+            /* Check if this object is not yet loaded */
+            if (!ls->libraries[e->lib_idx].objects[e->obj_idx].loaded) {
+                return e;
+            }
+        }
+        i = e->hash_next;
+    }
+    return NULL;
+}
+
+/*
+ * Build the library symbol index by scanning all library objects
+ * and recording their exported symbols.  Each library file is opened
+ * once and all its objects' symbol/string tables are read in a
+ * single pass.
+ */
+static int build_lib_index(LinkerState *ls, LibSymIndex *idx)
+{
+    int lib_idx, obj_idx;
+    
+    for (lib_idx = 0; lib_idx < ls->num_libraries; lib_idx++) {
+        LibraryInfo *lib = &ls->libraries[lib_idx];
+        FILE *fp;
+        
+        fp = fopen(lib->filename, "rb");
+        if (!fp) continue;
+        
+        for (obj_idx = 0; obj_idx < lib->num_objects; obj_idx++) {
+            ObjHeader header;
+            ObjSymbol *sym_buf;
+            char *strtab;
+            uint24 code_size, data_size;
+            uint24 num_symbols, num_relocs, num_externs, strtab_size;
+            long sym_pos, strtab_pos;
+            uint24 name_off;
+            int s;
+            
+            if (lib->objects[obj_idx].loaded) continue;
+            
+            /* Read header */
+            fseek(fp, lib->objects[obj_idx].offset, SEEK_SET);
+            if (fread(&header, sizeof(header), 1, fp) != 1) continue;
+            
+            code_size = READ24(header.code_size);
+            data_size = READ24(header.data_size);
+            num_symbols = READ24(header.num_symbols);
+            num_relocs = READ24(header.num_relocs);
+            num_externs = READ24(header.num_externs);
+            strtab_size = READ24(header.strtab_size);
+            
+            if (num_symbols == 0 || strtab_size == 0) continue;
+            
+            sym_pos = lib->objects[obj_idx].offset + sizeof(header) +
+                      code_size + data_size;
+            strtab_pos = sym_pos +
+                         (num_symbols * sizeof(ObjSymbol)) +
+                         (num_relocs * sizeof(ObjReloc)) +
+                         (num_externs * sizeof(ObjExtern));
+            
+            /* Read string table */
+            strtab = (char *)malloc(strtab_size);
+            if (!strtab) continue;
+            
+            fseek(fp, strtab_pos, SEEK_SET);
+            if (fread(strtab, 1, strtab_size, fp) != strtab_size) {
+                free(strtab);
+                continue;
+            }
+            
+            /* Read all symbol entries */
+            sym_buf = (ObjSymbol *)malloc(num_symbols * sizeof(ObjSymbol));
+            if (!sym_buf) {
+                free(strtab);
+                continue;
+            }
+            
+            fseek(fp, sym_pos, SEEK_SET);
+            if (fread(sym_buf, sizeof(ObjSymbol), num_symbols, fp)
+                    != num_symbols) {
+                free(sym_buf);
+                free(strtab);
+                continue;
+            }
+            
+            /* Add each exported symbol to the index */
+            for (s = 0; s < (int)num_symbols; s++) {
+                name_off = READ24(sym_buf[s].name_offset);
+                if (name_off < strtab_size) {
+                    lib_index_add(idx, &strtab[name_off],
+                                  lib_idx, obj_idx);
+                }
+            }
+            
+            free(sym_buf);
+            free(strtab);
+        }
+        
+        fclose(fp);
+    }
+    
+    return 0;
+}
+
 /*
  * Process libraries - selectively load objects that satisfy undefined
  * references.
  *
- * Optimised: allocates the externals scratch buffer once, opens each
- * object/library file once per iteration rather than per-symbol, and
- * reads each library object's symbol table once then checks all
- * undefined symbols against it.
+ * Builds a hash index of all exported library symbols once up front,
+ * then resolves undefined references with O(1) hash lookups instead
+ * of scanning every library object from disk.
  */
 static int process_libraries(LinkerState *ls)
 {
-    char (*undefined)[64];
-    char (*obj_ext)[64];
+    LibSymIndex idx;
+    char (*undefined)[MAX_SYM_NAME];
+    char (*obj_ext)[MAX_SYM_NAME];
     int num_undefined;
-    int i, j, k, lib_idx;
+    int i, j, k;
     int loaded_any;
     int total_loaded = 0;
     
@@ -571,17 +766,31 @@ static int process_libraries(LinkerState *ls)
         return 0;  /* No libraries to process */
     }
     
-    undefined = (char (*)[64])malloc(MAX_EXTERNS * 64);
+    /* Build library symbol index (reads all libraries once) */
+    if (lib_index_init(&idx) < 0) {
+        fprintf(stderr, "error: out of memory for library index\n");
+        return -1;
+    }
+    build_lib_index(ls, &idx);
+    
+    if (ls->verbose) {
+        printf("Library index: %d symbols from %d library(s)\n",
+               idx.num_entries, ls->num_libraries);
+    }
+    
+    undefined = (char (*)[MAX_SYM_NAME])malloc(MAX_EXTERNS * MAX_SYM_NAME);
     if (!undefined) {
         fprintf(stderr, "error: out of memory\n");
+        lib_index_free(&idx);
         return -1;
     }
     
     /* Allocate scratch buffer for per-object externals once */
-    obj_ext = (char (*)[64])malloc(256 * 64);
+    obj_ext = (char (*)[MAX_SYM_NAME])malloc(MAX_OBJ_EXTERNS * MAX_SYM_NAME);
     if (!obj_ext) {
         fprintf(stderr, "error: out of memory\n");
         free(undefined);
+        lib_index_free(&idx);
         return -1;
     }
     
@@ -598,7 +807,7 @@ static int process_libraries(LinkerState *ls)
             if (!ofp) continue;
             
             ext_count = get_object_externals_fp(ofp, &ls->objects[i],
-                                                obj_ext, 256);
+                                                obj_ext, MAX_OBJ_EXTERNS);
             fclose(ofp);
             
             for (j = 0; j < ext_count && num_undefined < MAX_EXTERNS; j++) {
@@ -613,7 +822,7 @@ static int process_libraries(LinkerState *ls)
                 }
                 if (k == num_undefined) {
                     /* Add to undefined list */
-                    str_copy(undefined[num_undefined], obj_ext[j], 64);
+                    str_copy(undefined[num_undefined], obj_ext[j], MAX_SYM_NAME);
                     num_undefined++;
                 }
             }
@@ -623,125 +832,41 @@ static int process_libraries(LinkerState *ls)
             break;  /* All symbols resolved */
         }
         
-        /* Search libraries for objects that define undefined symbols.
-         * Open each library file once, then scan its unloaded objects.
-         * For each unloaded object, read its symbol table and string
-         * table once, then check all undefined symbols against it. */
-        for (lib_idx = 0; lib_idx < ls->num_libraries; lib_idx++) {
-            LibraryInfo *lib = &ls->libraries[lib_idx];
-            FILE *lfp;
+        /* Resolve each undefined symbol via the library index.
+         * Each lookup is O(1) via the hash table. */
+        for (i = 0; i < num_undefined; i++) {
+            LibSymEntry *entry;
+            LibraryInfo *lib;
             
-            lfp = fopen(lib->filename, "rb");
-            if (!lfp) continue;
-            
-            for (j = 0; j < lib->num_objects; j++) {
-                ObjHeader header;
-                ObjSymbol *sym_buf;
-                char *strtab;
-                uint24 code_size, data_size;
-                uint24 num_symbols, num_relocs, num_externs, strtab_size;
-                long sym_pos, strtab_pos;
-                uint24 name_off;
-                int s;
-                int found_match;
-                
-                if (lib->objects[j].loaded) continue;
-                
-                /* Read header for this library object */
-                fseek(lfp, lib->objects[j].offset, SEEK_SET);
-                if (fread(&header, sizeof(header), 1, lfp) != 1) continue;
-                
-                code_size = READ24(header.code_size);
-                data_size = READ24(header.data_size);
-                num_symbols = READ24(header.num_symbols);
-                num_relocs = READ24(header.num_relocs);
-                num_externs = READ24(header.num_externs);
-                strtab_size = READ24(header.strtab_size);
-                
-                if (num_symbols == 0 || strtab_size == 0) continue;
-                
-                sym_pos = lib->objects[j].offset + sizeof(header) +
-                          code_size + data_size;
-                strtab_pos = sym_pos +
-                             (num_symbols * sizeof(ObjSymbol)) +
-                             (num_relocs * sizeof(ObjReloc)) +
-                             (num_externs * sizeof(ObjExtern));
-                
-                /* Read string table once for this library object */
-                strtab = (char *)malloc(strtab_size);
-                if (!strtab) continue;
-                
-                fseek(lfp, strtab_pos, SEEK_SET);
-                if (fread(strtab, 1, strtab_size, lfp) != strtab_size) {
-                    free(strtab);
-                    continue;
-                }
-                
-                /* Check each exported symbol against all undefineds.
-                 * Read all symbols into memory to avoid repeated seeks. */
-                found_match = 0;
-                sym_buf = (ObjSymbol *)malloc(num_symbols * sizeof(ObjSymbol));
-                if (!sym_buf) {
-                    free(strtab);
-                    continue;
-                }
-                
-                fseek(lfp, sym_pos, SEEK_SET);
-                if (fread(sym_buf, sizeof(ObjSymbol), num_symbols, lfp)
-                        != num_symbols) {
-                    free(sym_buf);
-                    free(strtab);
-                    continue;
-                }
-                
-                for (s = 0; s < (int)num_symbols && !found_match; s++) {
-                    name_off = READ24(sym_buf[s].name_offset);
-                    if (name_off >= strtab_size) continue;
-                    
-                    for (i = 0; i < num_undefined; i++) {
-                        if (str_casecmp(&strtab[name_off],
-                                        undefined[i]) == 0) {
-                            found_match = 1;
-                            break;
-                        }
-                    }
-                }
-                
-                free(sym_buf);
-                free(strtab);
-                
-                if (found_match) {
-                    /* This library object defines at least one needed
-                     * symbol - load it.  Close the library file first
-                     * since load_object_at will open it again. */
-                    fclose(lfp);
-                    lfp = NULL;
-                    
-                    if (ls->verbose) {
-                        printf("Loading from library '%s' (object at %ld)\n",
-                               lib->filename, lib->objects[j].offset);
-                    }
-                    
-                    if (load_object_at(ls, lib->filename,
-                                       lib->objects[j].offset) == 0) {
-                        lib->objects[j].loaded = 1;
-                        loaded_any = 1;
-                        total_loaded++;
-                    }
-                    
-                    /* Reopen library for remaining objects */
-                    lfp = fopen(lib->filename, "rb");
-                    if (!lfp) break;
-                }
+            /* Skip if another library object already defined it
+             * earlier in this iteration */
+            if (find_global(ls, undefined[i]) != NULL) {
+                continue;
             }
             
-            if (lfp) fclose(lfp);
+            entry = lib_index_find(&idx, undefined[i], ls);
+            if (!entry) continue;
+            
+            lib = &ls->libraries[entry->lib_idx];
+            
+            if (ls->verbose) {
+                printf("Loading from library '%s' for symbol '%s'\n",
+                       lib->filename, undefined[i]);
+            }
+            
+            if (load_object_at(ls, lib->filename,
+                               lib->objects[entry->obj_idx].offset) == 0) {
+                lib->objects[entry->obj_idx].loaded = 1;
+                loaded_any = 1;
+                total_loaded++;
+            }
         }
         
     } while (loaded_any);
     
     free(obj_ext);
     free(undefined);
+    lib_index_free(&idx);
     
     if (ls->verbose && total_loaded > 0) {
         printf("Loaded %d object(s) from libraries\n", total_loaded);
@@ -834,7 +959,7 @@ static int link_output(LinkerState *ls)
     uint24 offset, target_addr;
     uint8 section, target_sect;
     unsigned ext_index;
-    char ext_name[64];
+    char ext_name[MAX_SYM_NAME];
     GlobalSymbol *sym;
     unsigned char *code_buf;
     unsigned char *data_buf;
@@ -956,7 +1081,7 @@ static int link_output(LinkerState *ls)
                     ls->errors++;
                     continue;
                 }
-                str_copy(ext_name, &strtab[name_off], 64);
+                str_copy(ext_name, &strtab[name_off], MAX_SYM_NAME);
                 
                 sym = find_global(ls, ext_name);
                 if (!sym) {
